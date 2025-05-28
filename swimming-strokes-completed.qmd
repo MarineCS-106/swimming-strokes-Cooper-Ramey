@@ -1,0 +1,237 @@
+---
+title: "Swimming Strokes"
+format: html
+editor: visual
+---
+
+## Setup
+
+Dependencies: `install.packages(c("plotly", "ranger"))`
+
+```{r}
+#| label: setup
+#| message: false
+
+library(plotly)
+library(ranger)
+library(tidyverse)
+theme_set(theme_bw())
+
+```
+
+## Read data
+
+```{r}
+#| label: read-data
+
+#Read Ale's data, add datetime column
+ale <- read_csv2("data/ale.csv",
+                 col_types = cols(`Date` = "c",
+                                  `Time` = "c")) %>%
+  mutate(datetime = as.POSIXct(paste(Date, Time),
+                               tz = "Etc/UTC") %>% 
+           lubridate::with_tz("US/Pacific")) %>% 
+  pivot_longer(X:Z, names_to = "axis", values_to = "acc") %>% 
+  mutate(acc = as.numeric(acc))
+#Adds an axis column(instead of 3 different columns) and accelerometer column, then makes it numeric. This code chunk is formatting the data.
+```
+
+## Visualize data
+
+```{r}
+#| label: viz-data
+
+#Draws a plot based with X axis = datetime, uses accelorometer data, and color codes it based on axis
+p_ale <- ggplot(ale, aes(datetime, acc, color = axis)) +
+  geom_line()
+
+ggplotly(p_ale, dynamicTicks = TRUE)
+
+
+
+```
+
+## Annotate data
+
+```{r}
+#| label: annotate-train
+
+#Tells the model which types of stroke are being done at certain times
+train_strokes <- c("free", "back", "breast", "kick", "rest")
+train_times <- as.POSIXct(c("2025-05-21 14:23:44",
+                            "2025-05-21 14:24:34",
+                            "2025-05-21 14:25:44",
+                            "2025-05-21 14:27:22",
+                            "2025-05-21 14:28:50"), 
+                          tz = "US/Pacific")
+
+#Defines the interval of stroke
+ale_train <- ale %>% 
+  filter(between(datetime, min(train_times), max(train_times) - .01)) %>% 
+  mutate(stroke = train_strokes[findInterval(datetime, train_times)])
+
+```
+
+```{r}
+#| label: fig-viz-annotations
+#| fig-cap: Acceleration recorded by the biologger with siming strokes indicated by fill
+#Make the label start with fig-
+
+#Makes a little df with start and end times for strokes
+stroke_periods <- ale_train %>% 
+  group_by(stroke) %>% 
+  summarize(stroke_start = min(datetime),
+            stroke_end = max(datetime))
+
+#Adds stroke segments to the data plot
+ggplot(ale_train) +
+  geom_rect(aes(xmin = stroke_start, xmax = stroke_end, fill = stroke),
+            data = stroke_periods,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0.5) +
+  geom_line(aes(datetime, acc, color = axis))
+
+```
+
+See @fig-viz-annotations
+
+## Window data
+
+```{r}
+#| label: window-data
+
+
+#Makes a df with axis means and SD of values
+window_s <- 2
+
+mfv <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+#Groups observations by 2 into windows, which will be used to train model
+ale_windows <- ale_train %>% 
+  pivot_wider(names_from = axis, values_from = acc) %>% 
+  mutate(elapsed_s = as.numeric(datetime - datetime[1], unit = "secs"),
+         window = elapsed_s %/% window_s) %>% 
+  group_by(window) %>% 
+  summarize(x_mean = mean(X),
+            y_mean = mean(Y),
+            z_mean = mean(Z),
+            x_sd = sd(X),
+            y_sd = sd(Y),
+            z_sd = sd(Z),
+            stroke = factor(mfv(stroke))) %>% 
+  drop_na()   #GET RID OF THOSE PESKY NAs!!!
+
+```
+
+```{r}
+#| label: viz-windows
+
+#Compares the means and SD values for each axis in respect to each stroke
+ale_windows %>% 
+  pivot_longer(x_mean:z_sd,
+               names_to = "metric") %>% 
+  ggplot(aes(window, value, color = stroke)) +
+  geom_point() + 
+  geom_line() +
+  facet_wrap(~ metric)
+
+```
+
+## Train model
+
+```{r}
+#| label: train-model
+
+#Train the model! 
+stroke_rf <- ranger(
+  stroke ~ x_mean + x_sd + y_mean + y_sd + z_mean + z_sd,
+  data = ale_windows, 
+  num.trees = 100
+)
+
+```
+
+```{r}
+#| label: in-sample-perf
+#The model can "predict" the stroke based on given data. This is not really useful, since this is the exact data it was trained on. 
+ale_windows$stroke_pred <- predict(stroke_rf, ale_windows)$predictions
+table(ale_windows$stroke, ale_windows$stroke_pred)
+
+```
+
+## Test model
+
+```{r}
+#| label: viz-test-annotations
+
+#Formats the test data, it's the same process as before, but we aren't showing it to the model yet. 
+test_strokes <- c("free1", "breast1", "back1", "free2", "breast2", "free3", "rest")
+test_times <- as.POSIXct(c("2025-05-21 14:30:32",
+                           "2025-05-21 14:30:41",
+                           "2025-05-21 14:31:07",
+                           "2025-05-21 14:31:28",
+                           "2025-05-21 14:32:32",
+                           "2025-05-21 14:32:44",
+                           "2025-05-21 14:32:52"), 
+                         tz = "US/Pacific")
+
+ale_test <- ale %>% 
+  filter(between(datetime, min(test_times), max(test_times) - .01)) %>% 
+  mutate(stroke_id = test_strokes[findInterval(datetime, test_times)],
+         stroke = substr(stroke_id, 1, nchar(stroke_id) - 1))
+
+stroke_periods2 <- ale_test %>% 
+  group_by(stroke_id) %>% 
+  summarize(stroke = stroke[1],
+            stroke_start = min(datetime),
+            stroke_end = max(datetime))
+
+ggplot(ale_test) +
+  geom_rect(aes(xmin = stroke_start, xmax = stroke_end, fill = stroke),
+            data = stroke_periods2,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0.5) +
+  geom_line(aes(datetime, acc, color = axis))
+
+```
+
+```{r}
+#| label: predict-stroke
+
+#Give the test data to the model, and it produces a table of precision vs recall. 
+ale_windows2 <- ale_test %>% 
+  pivot_wider(names_from = axis, values_from = acc) %>% 
+  mutate(elapsed_s = as.numeric(datetime - datetime[1], unit = "secs"),
+         window = elapsed_s %/% window_s) %>% 
+  group_by(window) %>% 
+  summarize(x_mean = mean(X),
+            y_mean = mean(Y),
+            z_mean = mean(Z),
+            x_sd = sd(X),
+            y_sd = sd(Y),
+            z_sd = sd(Z),
+            stroke = factor(mfv(stroke), 
+                            levels = levels(ale_windows$stroke))) %>% 
+  drop_na()
+
+ale_windows2$stroke_pred <- predict(stroke_rf, ale_windows2)$predictions
+
+table(ale_windows2$stroke_pred, ale_windows2$stroke, 
+      dnn = c("predicted", "actual"))
+
+#The model does a decent job, but struggles with classifying freestyle as kicking. This may be due to the fact that Ale was intermitently using her arms while kicking in the training dataset
+```
+
+The precision is 100%, and the recall is 100%. This makes sense, since this was the data the model was trained on.
+
+|           | Free | Back | Breast | Kick |
+|-----------|------|------|--------|------|
+| Precision | 0.94 | 0.8  | 0.83   | 0.91 |
+| Recall    | 0.71 | 0.8  | 0.79   | 100  |
+
+Our precision was higher than our recall.
+
+If we increase the window size(interval) to 5, our precision and recall will likely go down slightly. It really depends on the data though. We have more data points per window, but we have fewer windows. The larger the windows, the more likely it will be that they contain multiple types of strokes.
