@@ -1,0 +1,206 @@
+---
+title: "Swimming Strokes"
+format: html
+editor: visual
+---
+
+## Setup
+
+Dependencies: `install.packages(c("plotly", "ranger"))`
+
+```{r}
+#| label: setup
+#| message: false
+
+library(plotly)
+library(ranger)
+library(tidyverse)
+theme_set(theme_bw())
+
+```
+
+## Read data
+
+```{r}
+#| label: read-data
+
+ale <- read_csv2("data/ale.csv",
+                 col_types = cols(`Date` = "c",
+                                  `Time` = "c")) %>%
+  mutate(datetime = as.POSIXct(paste(Date, Time),
+                               tz = "Etc/UTC") %>% 
+           lubridate::with_tz("US/Pacific")) %>% 
+  pivot_longer(X:Z, names_to = "axis", values_to = "acc") %>% 
+  mutate(acc = as.numeric(acc))
+
+```
+
+## Visualize data
+
+```{r}
+#| label: viz-data
+
+p_ale <- ggplot(ale, aes(datetime, acc, color = axis)) +
+  geom_line()
+
+ggplotly(p_ale, dynamicTicks = TRUE)
+
+```
+
+## Annotate data
+
+```{r}
+#| label: annotate-train
+
+train_strokes <- c("free", "back", "breast", "kick", "rest")
+train_times <- as.POSIXct(c("2025-05-21 14:23:44",
+                            "2025-05-21 14:24:34",
+                            "2025-05-21 14:25:44",
+                            "2025-05-21 14:27:22",
+                            "2025-05-21 14:28:50"), 
+                          tz = "US/Pacific")
+
+ale_train <- ale %>% 
+  filter(between(datetime, min(train_times), max(train_times) - .01)) %>% 
+  mutate(stroke = train_strokes[findInterval(datetime, train_times)])
+
+```
+
+```{r}
+#| label: viz-annotations
+
+stroke_periods <- ale_train %>% 
+  group_by(stroke) %>% 
+  summarize(stroke_start = min(datetime),
+            stroke_end = max(datetime))
+
+ggplot(ale_train) +
+  geom_rect(aes(xmin = stroke_start, xmax = stroke_end, fill = stroke),
+            data = stroke_periods,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0.5) +
+  geom_line(aes(datetime, acc, color = axis))
+
+```
+
+## Window data
+
+```{r}
+#| label: window-data
+
+window_s <- 2
+
+mfv <- function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+ale_windows <- ale_train %>% 
+  pivot_wider(names_from = axis, values_from = acc) %>% 
+  mutate(elapsed_s = as.numeric(datetime - datetime[1], unit = "secs"),
+         window = elapsed_s %/% window_s) %>% 
+  group_by(window) %>% 
+  summarize(x_mean = mean(X),
+            y_mean = mean(Y),
+            z_mean = mean(Z),
+            x_sd = sd(X),
+            y_sd = sd(Y),
+            z_sd = sd(Z),
+            stroke = factor(mfv(stroke))) %>% 
+  drop_na()
+
+```
+
+```{r}
+#| label: viz-windows
+
+ale_windows %>% 
+  pivot_longer(x_mean:z_sd,
+               names_to = "metric") %>% 
+  ggplot(aes(window, value, color = stroke)) +
+  geom_point() + 
+  geom_line() +
+  facet_wrap(~ metric)
+
+```
+
+## Train model
+
+```{r}
+#| label: train-model
+
+stroke_rf <- ranger(
+  stroke ~ x_mean + x_sd + y_mean + y_sd + z_mean + z_sd,
+  data = ale_windows, 
+  num.trees = 100
+)
+
+```
+
+```{r}
+#| label: in-sample-perf
+
+ale_windows$stroke_pred <- predict(stroke_rf, ale_windows)$predictions
+table(ale_windows$stroke, ale_windows$stroke_pred)
+
+```
+
+## Test model
+
+```{r}
+#| label: viz-test-annotations
+
+test_strokes <- c("free1", "breast1", "back1", "free2", "breast2", "free3", "rest")
+test_times <- as.POSIXct(c("2025-05-21 14:30:32",
+                           "2025-05-21 14:30:41",
+                           "2025-05-21 14:31:07",
+                           "2025-05-21 14:31:28",
+                           "2025-05-21 14:32:32",
+                           "2025-05-21 14:32:44",
+                           "2025-05-21 14:32:52"), 
+                         tz = "US/Pacific")
+
+ale_test <- ale %>% 
+  filter(between(datetime, min(test_times), max(test_times) - .01)) %>% 
+  mutate(stroke_id = test_strokes[findInterval(datetime, test_times)],
+         stroke = substr(stroke_id, 1, nchar(stroke_id) - 1))
+
+stroke_periods2 <- ale_test %>% 
+  group_by(stroke_id) %>% 
+  summarize(stroke = stroke[1],
+            stroke_start = min(datetime),
+            stroke_end = max(datetime))
+
+ggplot(ale_test) +
+  geom_rect(aes(xmin = stroke_start, xmax = stroke_end, fill = stroke),
+            data = stroke_periods2,
+            ymin = -Inf, ymax = Inf,
+            alpha = 0.5) +
+  geom_line(aes(datetime, acc, color = axis))
+
+```
+
+```{r}
+#| label: predict-stroke
+
+ale_windows2 <- ale_test %>% 
+  pivot_wider(names_from = axis, values_from = acc) %>% 
+  mutate(elapsed_s = as.numeric(datetime - datetime[1], unit = "secs"),
+         window = elapsed_s %/% window_s) %>% 
+  group_by(window) %>% 
+  summarize(x_mean = mean(X),
+            y_mean = mean(Y),
+            z_mean = mean(Z),
+            x_sd = sd(X),
+            y_sd = sd(Y),
+            z_sd = sd(Z),
+            stroke = factor(mfv(stroke), 
+                            levels = levels(ale_windows$stroke))) %>% 
+  drop_na()
+
+ale_windows2$stroke_pred <- predict(stroke_rf, ale_windows2)$predictions
+
+table(ale_windows2$stroke_pred, ale_windows2$stroke, 
+      dnn = c("predicted", "actual"))
+
+```
